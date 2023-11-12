@@ -24,23 +24,12 @@ from litex.soc.cores.gpio import GPIOOut
 from litex.soc.cores.led import LedChaser
 from litex.soc.integration.soc_core import *
 from litex.soc.integration.builder import *
+from litex.soc.interconnect.packet import PacketFIFO
 
+from liteeth.common import eth_udp_user_description
 from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
+from liteeth.core import LiteEthUDPIPCore
 from litex.build.generic_platform import *
-
-# IOs ----------------------------------------------------------------------------------------------
-
-_gpios = [
-    # GPIOs.
-    ("gpio", 0, Pins("j4:0"), IOStandard("LVCMOS33")),
-    ("gpio", 1, Pins("j4:1"), IOStandard("LVCMOS33")),
-
-    # Servos.
-    ("servo", 0, Pins("j3:0"), IOStandard("LVCMOS33")),
-    ("servo", 1, Pins("j3:1"), IOStandard("LVCMOS33")),
-    ("servo", 2, Pins("j3:2"), IOStandard("LVCMOS33")),
-    ("servo", 3, Pins("j3:4"), IOStandard("LVCMOS33")),
-]
 
 # CRG ----------------------------------------------------------------------------------------------
 
@@ -62,8 +51,8 @@ class _CRG(LiteXModule):
 # ColorLite ----------------------------------------------------------------------------------------
 
 class ColorLite(SoCMini):
-    def __init__(self, sys_clk_freq=int(40e6), with_etherbone=True, ip_address=None, mac_address=None):
-        platform = colorlight_5a_75b.Platform(revision="7.0")
+    def __init__(self, sys_clk_freq=int(40e6), ip_address=None, mac_address=None):
+        platform = colorlight_5a_75b.Platform(revision="8.0")
 
         # CRG --------------------------------------------------------------------------------------
         self.crg = _CRG(platform, sys_clk_freq)
@@ -71,53 +60,44 @@ class ColorLite(SoCMini):
         # SoCMini ----------------------------------------------------------------------------------
         SoCMini.__init__(self, platform, clk_freq=sys_clk_freq)
 
-        # Etherbone --------------------------------------------------------------------------------
-        if with_etherbone:
-            self.ethphy = LiteEthPHYRGMII(
-                clock_pads = self.platform.request("eth_clocks"),
-                pads       = self.platform.request("eth"),
-                tx_delay   = 0e-9)
-            self.add_etherbone(
-                phy         = self.ethphy,
-                ip_address  = ip_address,
-                mac_address = mac_address,
-                data_width  = 32,
-            )
-
-        # SPIFlash ---------------------------------------------------------------------------------
-        self.spiflash = ECP5SPIFlash(
-            pads         = platform.request("spiflash"),
-            sys_clk_freq = sys_clk_freq,
-            spi_clk_freq = 5e6,
+        self.ethphy = ethphy = LiteEthPHYRGMII(
+            clock_pads = self.platform.request("eth_clocks"),
+            pads       = self.platform.request("eth"),
+            tx_delay           = 0e-9,
+            rx_delay           = 2e-9,
+            with_hw_init_reset = False, # FIXME: required since sys_clk = eth_rx_clk.
         )
 
-        # Led --------------------------------------------------------------------------------------
-        self.leds = LedChaser(
-            pads         = platform.request_all("user_led_n"),
-            sys_clk_freq = sys_clk_freq)
+        data_width = 32
 
-        # GPIOs ------------------------------------------------------------------------------------
-        platform.add_extension(_gpios)
+        self.core = core = LiteEthUDPIPCore(ethphy,
+            mac_address       = mac_address,
+            ip_address        = ip_address,
+            clk_freq          = sys_clk_freq,
+            dw                = data_width,
+            with_sys_datapath = True,
+            tx_cdc_depth      = 16,
+            tx_cdc_buffered   = True,
+            rx_cdc_depth      = 16,
+            rx_cdc_buffered   = True,
+        )
 
-        # Power switch
-        power_sw_pads  = platform.request("gpio", 0)
-        power_sw_gpio  = Signal()
-        power_sw_timer = WaitTimer(2*sys_clk_freq) # Set Power switch high after power up for 2s.
-        self.comb += power_sw_timer.wait.eq(1)
-        self.submodules += power_sw_timer
-        self.gpio0 = GPIOOut(power_sw_gpio)
-        self.comb += power_sw_pads.eq(power_sw_gpio | ~power_sw_timer.done)
+        udp_listen_port = 13373
+        raw_port = self.core.udp.crossbar.get_port(udp_listen_port, dw=data_width)
 
-        # Reset Switch
-        reset_sw_pads  = platform.request("gpio", 1)
-        self.gpio1 = GPIOOut(reset_sw_pads)
+        self.fifo = fifo = PacketFIFO(eth_udp_user_description(data_width),
+            payload_depth = 32,
+            param_depth   = 4,
+            buffered      = True
+        )
 
-        # Servos -----------------------------------------------------------------------------------
-        from litex.soc.cores.pwm import PWM
-        for n in range(4):
-            servo_pad = platform.request("servo", n)
-            servo     = PWM(servo_pad)
-            setattr(self.submodules, f"servo{n}", servo)
+        self.comb += [
+            raw_port.source.connect(fifo.sink, omit = {"src_port", "dst_port"}),
+            fifo.sink.src_port.eq(raw_port.source.dst_port),
+            fifo.sink.dst_port.eq(raw_port.source.src_port),
+            fifo.source.connect(raw_port.sink)
+        ]
+        
 
 # Build --------------------------------------------------------------------------------------------
 
@@ -131,7 +111,7 @@ def main():
     args = parser.parse_args()
 
     soc     = ColorLite(ip_address=args.ip_address, mac_address=int(args.mac_address, 0))
-    builder = Builder(soc, output_dir="build", csr_csv="scripts/csr.csv")
+    builder = Builder(soc, output_dir="build")
     builder.build(build_name="colorlite", run=args.build)
 
     if args.load:
@@ -141,8 +121,8 @@ def main():
     if args.flash:
         prog = soc.platform.create_programmer()
         os.system("cp bit_to_flash.py build/gateware/")
-        os.system("cd build/gateware && ./bit_to_flash.py colorlite.bit colorlite.svf.flash")
-        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".svf.flash"))
+        os.system("cd build/gateware && chmod +x ./build_colorlite.sh && ./build_colorlite.sh")
+        prog.load_bitstream(os.path.join(builder.gateware_dir, soc.build_name + ".bit"))
 
 if __name__ == "__main__":
     main()
