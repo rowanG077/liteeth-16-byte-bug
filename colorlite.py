@@ -10,12 +10,18 @@ import os
 import argparse
 import sys
 
+# litex_projects_path = "/home/rowan.goemans/Documents/engineering"
+# sys.path = [s for s in sys.path if "liteeth" not in s]
+# sys.path.append(f"{litex_projects_path}/liteeth")
+# sys.path = [s for s in sys.path if "litex" not in s]
+# sys.path.append(f"{litex_projects_path}/litex")
+
 from migen import *
 from migen.genlib.misc import WaitTimer
 from migen.genlib.resetsync import AsyncResetSynchronizer
 
 from litex.gen import *
-
+from litex.build.lattice.platform import LatticePlatform
 from litex_boards.platforms import colorlight_5a_75b
 
 from litex.soc.cores.clock import *
@@ -29,73 +35,109 @@ from litex.soc.interconnect.packet import PacketFIFO
 from liteeth.common import eth_udp_user_description
 from liteeth.phy.ecp5rgmii import LiteEthPHYRGMII
 from liteeth.core import LiteEthUDPIPCore
+from liteeth.common import *
+from liteeth.core.udp import LiteEthUDPTX
 from litex.build.generic_platform import *
 
-# CRG ----------------------------------------------------------------------------------------------
+_io = [
+    ("sys_clock", 0, Pins(1)),
+    ("sys_reset", 1, Pins(1)),
+    ("rgmii_clocks", 0,
+        Subsignal("tx", Pins(1)),
+        Subsignal("rx", Pins(1))
+    ),
+    ("rgmii_tx_refclk", 0, Pins(1)),
+    ("rgmii", 0,
+        # Subsignal("rst_n",   Pins(1)),
+        Subsignal("int_n",   Pins(1)),
+        Subsignal("mdio",    Pins(1)),
+        Subsignal("mdc",     Pins(1)),
+        Subsignal("rx_ctl",  Pins(1)),
+        Subsignal("rx_data", Pins(4)),
+        Subsignal("tx_ctl",  Pins(1)),
+        Subsignal("tx_data", Pins(4))
+    ),
+]
 
-class _CRG(LiteXModule):
-    def __init__(self, platform, sys_clk_freq):
-        self.cd_sys = ClockDomain()
-        # # #
+def get_udp_raw_port_ios(name, data_width):
+    return [
+        (f"{name}", 0,
+            # Sink.
+            Subsignal("sink_ip_address", Pins(32)),
+            Subsignal("sink_src_port",   Pins(16)),
+            Subsignal("sink_dst_port",   Pins(16)),
+            Subsignal("sink_valid",      Pins(1)),
+            Subsignal("sink_length",     Pins(16)),
+            Subsignal("sink_last",       Pins(1)),
+            Subsignal("sink_ready",      Pins(1)),
+            Subsignal("sink_data",       Pins(data_width)),
+            Subsignal("sink_last_be",    Pins(data_width//8)),
+        ),
+    ]
 
-        # Clk / Rst.
-        clk25 = platform.request("clk25")
-        rst_n = platform.request("user_btn_n", 0)
+def get_ip_raw_port_ios(name, data_width):
+    return [
+        (f"{name}", 0,
+            # Sink.
+            Subsignal("source_ip_address", Pins(32)),
+            Subsignal("source_protocol",   Pins(16)),
+            Subsignal("source_length",   Pins(16)),
+            Subsignal("source_valid",      Pins(1)),
+            Subsignal("source_data",     Pins(16)),
+            Subsignal("source_ready",      Pins(1)),
+            Subsignal("source_error",       Pins(data_width)),
+            Subsignal("source_last",       Pins(1)),
+            Subsignal("source_last_be",    Pins(data_width//8)),
+        ),
+    ]
 
-        # PLL.
-        self.pll = pll = ECP5PLL()
-        self.comb += pll.reset.eq(~rst_n)
-        pll.register_clkin(clk25, 25e6)
-        pll.create_clkout(self.cd_sys, sys_clk_freq)
 
 # ColorLite ----------------------------------------------------------------------------------------
 
 class ColorLite(SoCMini):
     def __init__(self, sys_clk_freq=int(40e6), ip_address=None, mac_address=None):
-        platform = colorlight_5a_75b.Platform(revision="8.0")
+        platform  = LatticePlatform("LFE5U-25F-6BG256C", io=[], toolchain="trellis")
+        platform.add_extension(_io)
 
         # CRG --------------------------------------------------------------------------------------
-        self.crg = _CRG(platform, sys_clk_freq)
+        self.crg = CRG(platform.request("sys_clock"), platform.request("sys_reset"))
 
         # SoCMini ----------------------------------------------------------------------------------
         SoCMini.__init__(self, platform, clk_freq=sys_clk_freq)
 
-        self.ethphy = ethphy = LiteEthPHYRGMII(
-            clock_pads = self.platform.request("eth_clocks"),
-            pads       = self.platform.request("eth"),
-            tx_delay           = 0e-9,
-            rx_delay           = 2e-9,
-            with_hw_init_reset = False, # FIXME: required since sys_clk = eth_rx_clk.
-        )
-
         data_width = 32
+        self.core = core = LiteEthUDPTX(convert_ip(ip_address), dw=data_width)
 
-        self.core = core = LiteEthUDPIPCore(ethphy,
-            mac_address       = mac_address,
-            ip_address        = ip_address,
-            clk_freq          = sys_clk_freq,
-            dw                = data_width,
-            with_sys_datapath = True,
-            tx_cdc_depth      = 16,
-            tx_cdc_buffered   = True,
-            rx_cdc_depth      = 16,
-            rx_cdc_buffered   = True,
-        )
+        platform.add_extension(get_udp_raw_port_ios("udp", data_width = data_width))
+        port_udp = platform.request("udp")
 
-        udp_listen_port = 13373
-        raw_port = self.core.udp.crossbar.get_port(udp_listen_port, dw=data_width)
+        platform.add_extension(get_ip_raw_port_ios("ip", data_width = data_width))
+        port_ip = platform.request("ip")
 
-        self.fifo = fifo = PacketFIFO(eth_udp_user_description(data_width),
-            payload_depth = 32,
-            param_depth   = 4,
-            buffered      = True
-        )
-
+        # Connect user IO to UDPTx
         self.comb += [
-            raw_port.source.connect(fifo.sink, omit = {"src_port", "dst_port"}),
-            fifo.sink.src_port.eq(raw_port.source.dst_port),
-            fifo.sink.dst_port.eq(raw_port.source.src_port),
-            fifo.source.connect(raw_port.sink)
+            core.sink.valid.eq(port_udp.sink_valid),
+            core.sink.last.eq(port_udp.sink_last),
+            core.sink.dst_port.eq(port_udp.sink_dst_port),
+            core.sink.src_port.eq(port_udp.sink_src_port),
+            core.sink.ip_address.eq(port_udp.sink_ip_address),
+            core.sink.length.eq(port_udp.sink_length),
+            port_udp.sink_ready.eq(core.sink.ready),
+            core.sink.data.eq(port_udp.sink_data),
+            core.sink.last_be.eq(port_udp.sink_last_be),
+        ]
+
+        # Connect UDPTx IP out to user IO
+        self.comb += [
+            port_ip.source_ip_address.eq(core.source.ip_address),
+            port_ip.source_protocol.eq(core.source.protocol),
+            port_ip.source_length.eq(core.source.length),
+            port_ip.source_valid.eq(core.source.valid),
+            port_ip.source_data.eq(core.source.data),
+            core.source.ready.eq(port_ip.source_ready),
+            port_ip.source_error.eq(core.source.error),
+            port_ip.source_last.eq(core.source.last),
+            port_ip.source_last_be.eq(core.source.last_be),
         ]
         
 
